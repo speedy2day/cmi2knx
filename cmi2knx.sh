@@ -10,7 +10,14 @@
 #                   - curl
 #
 # Autor: Sebastian Schnittert (schnittert@gmail.com)
-# Datum: 18.10.2020
+# Datum: 27.10.2021
+
+# Intervall (in Sekunden) der zyklischen Abfrage des TA C.M.I.
+# ACHTUNG: Dieses Intervall darf nicht unter 60 Sekunden liegen, da das C.M.I. dann die Abfrage verweigert!
+REFRESH_INTERVALL=60
+
+# Intervall (in Sekunden) nach dem ein Datum auch ohne Änderung erneut auf den Bus gelegt werden soll
+REPEAT_INTERVALL=900 # 15 min.
 
 # Die IP-Adresse des TA C.M.I.
 CMI_HOST="192.168.188.21"
@@ -22,7 +29,7 @@ SOLAR_NODE="42"
 MONITOR_NODE="50"
 # Absoluter Pfad zur Login-Credentials-Datei fürs C.M.I. - Login als "expert" notwendig
 # Login-File Format: machine <ip> login <name> password <pw>
-LOGIN_FILE="/opt/cmi2knx/.cmi-credentials"
+LOGIN_FILE="/home/pi/smarthome/cmi2knx/.cmi-credentials"
 
 # IP-Adresse des knxd-Host ("localhost", wenn gleicher Rechner)
 KNXD_HOST="localhost"
@@ -101,7 +108,7 @@ main() {
         for i in {1..6}
         do
             # Wert mittels JSON-Parser holen und in DPT 9.xxx Format umwandeln
-            HEX=$(dec_to_dpt_9 "$(jq '.Data.Inputs['$((i-1))'].Value.Value' <<< "${JSON}")")
+            HEX="$(dec_to_dpt_9 "$(jq '.Data.Inputs['$((i-1))'].Value.Value' <<< "${JSON}")")"
             # Wert am Bus setzen
             write_to_knx_grp "${HEX}" "OVEN" "I" ${i}
         done
@@ -116,7 +123,7 @@ main() {
         for i in {1..6}
         do
             # Wert mittels JSON-Parser holen und in DPT 9.xxx Format umwandeln
-            HEX=$(dec_to_dpt_9 "$(jq '.Data.Inputs['$((i-1))'].Value.Value' <<< "${JSON}")")
+            HEX="$(dec_to_dpt_9 "$(jq '.Data.Inputs['$((i-1))'].Value.Value' <<< "${JSON}")")"
             # Wert am Bus setzen
             write_to_knx_grp "${HEX}" "SOLAR" "I" ${i}
         done
@@ -124,7 +131,7 @@ main() {
         for i in {1..8}
         do
             # Wert mittels JSON-Parser holen und in DPT 9.xxx Format umwandeln
-            HEX=$(dec_to_dpt_9 "$(jq '.Data."DL-Bus"['$((i-1))'].Value.Value' <<< "${JSON}")")
+            HEX="$(dec_to_dpt_9 "$(jq '.Data."DL-Bus"['$((i-1))'].Value.Value' <<< "${JSON}")")"
             # Wert am Bus setzen
             write_to_knx_grp "${HEX}" "SOLAR" "D" ${i}
         done
@@ -139,7 +146,7 @@ main() {
         for i in {1..4}
         do
             # Wert mittels JSON-Parser holen und in DPT 9.xxx Format umwandeln
-            HEX=$(dec_to_dpt_9 "$(jq '.Data.Inputs['$((i-1))'].Value.Value' <<< "${JSON}")")
+            HEX="$(dec_to_dpt_9 "$(jq '.Data.Inputs['$((i-1))'].Value.Value' <<< "${JSON}")")"
             # Wert am Bus setzen
             write_to_knx_grp "${HEX}" "MONITOR" "I" "${i}"
         done
@@ -150,6 +157,36 @@ main() {
         echo "Falscher Eingabeparameter."
         echo "Nur --oven, --solar oder --monitor sind für die Spezifikation des CAN-Knoten zugelassen"
     esac
+}
+
+# Funktion zur Prüfung ob eine Änderung des Wertes stattgefunden hat
+# oder das Wiederholungsintervall abgelaufen ist.
+# $1: 2-Byte-HEX-Wert
+# $2: Gruppenadressen-Prefix
+# $3: Parameter-Typ [I | O | D | ...] (vgl. CMI_JSON_API_V5.pdf)
+# $4: Index
+value_is_new_or_elapsed() {
+    # Data-Cache und Timestamp referenzieren
+    local CACHE=""${2}"_"${3}""${4}"_CACHE"
+    local TIMESTAMP=""${2}"_"${3}""${4}"_TIMESTAMP"
+    # Timestamp beim ersten Durchlauf setzen
+    if [ -z "${!TIMESTAMP}" ]; then
+        eval "${TIMESTAMP}=0"
+    fi
+
+    # Die Zeit seit der letzten Aktualisierung berechnen
+    ELAPSED=$(($(date +%s)-${!TIMESTAMP}))
+    # Hat eine Änderung des Datums stattgefunden? (KNX-Last verringern)
+    # ODER ist das Wiederholungsintervall abgelaufen?
+    if [ "${!CACHE}" != "${1}" ] || [ "${ELAPSED}" -ge "${REPEAT_INTERVALL}" ]; then
+        # Das neue Datum sichern
+        eval "${CACHE}='${1}'"
+        # Den aktuellen Timestamp setzen
+        eval "${TIMESTAMP}=$(date +%s)"
+        return 1
+    else
+        return 0
+    fi
 }
 
 # Funktion zum Abholen und prüfen der JSON-Daten vom C.M.I.
@@ -178,10 +215,14 @@ get_and_check_json() {
 # $3: Parameter-Typ [I | O | D | ...] (vgl. CMI_JSON_API_V5.pdf)
 # $4: Index
 write_to_knx_grp() {
-    # Zu schreibende Gruppenadresse
-    local GRP="\$${2}_${3}${4}_GROUPADDRESS"
-    # Wert am Bus setzen
-    eval "${KNX_GROUPWRITE} ${GRP} ${1} &> /dev/null"
+    # Liegt ein neuer Wert vor oder ist das Wiederholungs-Intervall abgelaufen?
+    value_is_new_or_elapsed "${1}" "${2}" "${3}" "${4}"
+    if [ $? -eq 1 ]; then
+        # Zu schreibende Gruppenadresse
+        local GRP="\$"${2}"_"${3}""${4}"_GROUPADDRESS"
+        # Wert am Bus setzen
+        eval "${KNX_GROUPWRITE} ${GRP} ${1} &> /dev/null"
+    fi
 }
 
 # Funktionsbeschreibung:
@@ -234,22 +275,36 @@ dec_to_dpt_9() {
     echo "$(cut -c -2 <<< "$H") $(cut -c 3- <<< "$H")"
 }
 
-# Wenn mit Parameter aufgerufen wird, so weitergeben
+# Wenn mit Parameter aufgerufen wird, so weitergeben und nur einmalig ausführen.
 if [[ $# -gt 0 ]] ; then
     # Main-Funktion mit allen Kommandozeilen-Parametern aufrufen
     main "$@"
 else
-    # Anhand der Uhrzeit entscheiden, welcher CAN-Teilnehmer abgefragt wird
+    # Prüfen, ob das Abfrageintervall mind. 60 Sekunden beträgt
     # (Wird nötig, da das C.M.I. nur 1 Anfrage pro Minute zulässt)
-    case $(bc <<< "$(date +%M)%3") in
-        "0")
-        main --oven
-        ;;
-        "1")
-        main --solar
-        ;;
-        "2")
-        main --monitor
-        ;;
-    esac
+    if [[ $REFRESH_INTERVALL -lt 60 ]]; then
+        echo "Das REFRESH_INTERVAL darf nicht unter 60 liegen" & exit 0
+    fi
+    # Mit dem Ofen-Regler beginnen
+    NEXT_NODE=0
+    # Ohne Parameter wird das Skript dauerhaft jede Minute ausgeführt
+    while true; do
+        # Zyklisch alle Knoten durchlaufen
+        case $NEXT_NODE in
+            "0")
+            main --oven
+            NEXT_NODE=1
+            ;;
+            "1")
+            main --solar
+            NEXT_NODE=2
+            ;;
+            "2")
+            main --monitor
+            NEXT_NODE=0
+            ;;
+        esac
+        # Das Abfrageintervall abwarten
+        sleep "${REFRESH_INTERVALL}"
+    done
 fi

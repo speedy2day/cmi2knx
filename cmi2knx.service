@@ -1,0 +1,10 @@
+[Unit]
+Description=C.M.I. to KNX
+
+[Service]
+ExecStart=/home/pi/smarthome/cmi2knx/cmi2knx.sh
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
